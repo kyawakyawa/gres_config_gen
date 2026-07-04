@@ -1,12 +1,72 @@
 #!/bin/bash
 
-NUM_GPUS=$(nvidia-smi -L | wc -l)
-NUM_CORES=$(nproc)
-
 NAME="gpu"
 HEADER_FILENAME=""
 PRINT_USAGE=0
 AUTODETECT=""
+NO_CPUS=0
+SOCKET_ALLOC=0
+NUM_SOCKETS=""
+CORES_PER_SOCKET=""
+SOCKET_CPU_RANGES=()
+
+print_usage() {
+	echo "Usage:"
+	echo "gres_conf_gen [-n|--name DeviceName [Default:gpu]] [-h|--header HeaderFileName [Default:none]] [-a|--autodetect AutoDetectOption [Default:none]] [--no-cpus] [--sockets [NumSockets] [--cores-per-socket NumCores]]"
+}
+
+is_positive_integer() {
+	[[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+detect_socket_cpu_ranges() {
+	mapfile -t SOCKET_CPU_RANGES < <(
+		lscpu -p=CPU,SOCKET | awk -F, '
+			/^#/ { next }
+			{
+				cpu = $1
+				socket = $2
+
+				if (!(socket in seen)) {
+					seen[socket] = 1
+					socket_order[++num_sockets] = socket
+					range_start[socket] = cpu
+					range_end[socket] = cpu
+					next
+				}
+
+				if (cpu == range_end[socket] + 1) {
+					range_end[socket] = cpu
+					next
+				}
+
+				append_range(socket)
+				range_start[socket] = cpu
+				range_end[socket] = cpu
+			}
+
+			function append_range(socket) {
+				if (ranges[socket] != "") {
+					ranges[socket] = ranges[socket] ","
+				}
+
+				if (range_start[socket] == range_end[socket]) {
+					ranges[socket] = ranges[socket] range_start[socket]
+				} else {
+					ranges[socket] = ranges[socket] range_start[socket] "-" range_end[socket]
+				}
+			}
+
+			END {
+				for (i = 1; i <= num_sockets; i++) {
+					socket = socket_order[i]
+					append_range(socket)
+					print ranges[socket]
+				}
+			}
+		'
+	)
+}
 
 while [[ $# -gt 0 ]]
 do
@@ -28,29 +88,96 @@ do
 			shift
 			shift
 			;;
+		--no-cpus)
+			NO_CPUS=1
+			shift
+			;;
+		-S|--sockets)
+			SOCKET_ALLOC=1
+			if [ -n "$2" ] && [[ "$2" != -* ]]; then
+				NUM_SOCKETS="$2"
+				shift
+				shift
+			else
+				shift
+			fi
+			;;
+		-C|--cores-per-socket)
+			CORES_PER_SOCKET="$2"
+			shift
+			shift
+			;;
 		-u|--usage|*)
 			PRINT_USAGE=1
-			shift
 			shift
 			;;
 	esac
 done
 
 if [ $PRINT_USAGE -eq 1 ];then
-	echo "Usage:"
-	echo "gres_conf_gen [-n|--name DeviceName [Default:gpu]] [-h|--header HeaderFileName [Default:none]] [-a|--autodetect AutoDetectOption [Default:none]]"
+	print_usage
 	exit 1
 fi
 
+if [ "$NO_CPUS" -eq 1 ] && { [ "$SOCKET_ALLOC" -eq 1 ] || [ -n "$CORES_PER_SOCKET" ]; }; then
+	echo "Error: --no-cpus cannot be used with --sockets or --cores-per-socket." >&2
+	exit 1
+fi
+
+if [ "$SOCKET_ALLOC" -eq 0 ] && [ -n "$CORES_PER_SOCKET" ]; then
+	echo "Error: --cores-per-socket must be used with --sockets." >&2
+	exit 1
+fi
+
+if [ "$SOCKET_ALLOC" -eq 1 ] && { [ -n "$NUM_SOCKETS" ] && [ -z "$CORES_PER_SOCKET" ]; }; then
+	echo "Error: --sockets and --cores-per-socket must be specified together." >&2
+	exit 1
+fi
+
+if [ -n "$NUM_SOCKETS" ] && ! is_positive_integer "$NUM_SOCKETS"; then
+	echo "Error: --sockets must be a positive integer." >&2
+	exit 1
+fi
+
+if [ -n "$CORES_PER_SOCKET" ] && ! is_positive_integer "$CORES_PER_SOCKET"; then
+	echo "Error: --cores-per-socket must be a positive integer." >&2
+	exit 1
+fi
+
+NUM_GPUS=$(nvidia-smi -L | wc -l)
+NUM_CORES=$(nproc)
+
+if [ "$SOCKET_ALLOC" -eq 1 ] && [ -z "$NUM_SOCKETS" ]; then
+	detect_socket_cpu_ranges
+	NUM_SOCKETS=${#SOCKET_CPU_RANGES[@]}
+
+	if [ "$NUM_SOCKETS" -eq 0 ]; then
+		echo "Error: failed to detect socket CPU ranges from lscpu." >&2
+		exit 1
+	fi
+fi
+
 if [[ ! -z "$HEADER_FILENAME" ]];then
-	cat $HEADER_FILENAME
+	cat "$HEADER_FILENAME"
 fi
 
 for gpu in $(seq 0 $(($NUM_GPUS - 1)));
 do
-	start_core=$(($gpu * $NUM_CORES / $NUM_GPUS))
-	end_core=$((($gpu + 1) * $NUM_CORES / $NUM_GPUS - 1))
-	printf "Name=%-10s File=/dev/nvidia%d CPUs=%d-%d\n" $NAME $gpu $start_core $end_core
+	if [ "$NO_CPUS" -eq 1 ]; then
+		printf "Name=%-10s File=/dev/nvidia%d\n" "$NAME" "$gpu"
+	elif [ "$SOCKET_ALLOC" -eq 1 ] && [ -z "$CORES_PER_SOCKET" ]; then
+		socket=$(($gpu * $NUM_SOCKETS / $NUM_GPUS))
+		printf "Name=%-10s File=/dev/nvidia%d CPUs=%s\n" "$NAME" "$gpu" "${SOCKET_CPU_RANGES[$socket]}"
+	elif [ "$SOCKET_ALLOC" -eq 1 ]; then
+		socket=$(($gpu * $NUM_SOCKETS / $NUM_GPUS))
+		start_core=$(($socket * $CORES_PER_SOCKET))
+		end_core=$((($socket + 1) * $CORES_PER_SOCKET - 1))
+		printf "Name=%-10s File=/dev/nvidia%d CPUs=%d-%d\n" "$NAME" "$gpu" "$start_core" "$end_core"
+	else
+		start_core=$(($gpu * $NUM_CORES / $NUM_GPUS))
+		end_core=$((($gpu + 1) * $NUM_CORES / $NUM_GPUS - 1))
+		printf "Name=%-10s File=/dev/nvidia%d CPUs=%d-%d\n" "$NAME" "$gpu" "$start_core" "$end_core"
+	fi
 done
 
 if [[ -n "$AUTODETECT" ]]; then
